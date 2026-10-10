@@ -1,0 +1,23 @@
+{
+  "name": "codepilot",
+  "version": "1.0.0",
+  "description": "AI-Powered Interactive Programming Tutor & Realtime Collaborative Code Studio",
+  "scripts": {
+    "backend": "npm --prefix backend run dev",
+    "frontend": "npm --prefix frontend run dev",
+    "test:backend": "npm --prefix backend test"
+  },
+  "keywords": [
+    "ai",
+    "gemini",
+    "code-tutor",
+    "collaborative-coding",
+    "realtime",
+    "socketio",
+    "monaco-editor",
+    "ast-analyzer",
+    "programming-education"
+  ],
+  "author": "Anjali Agarwal",
+  "license": "MIT"
+}

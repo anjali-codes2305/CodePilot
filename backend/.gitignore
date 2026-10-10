@@ -1,0 +1,22 @@
+# Node modules
+node_modules/
+
+# Environment Variables
+.env
+.env.*
+!.env.example
+
+# SQLite Database & Storage
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+logs/
