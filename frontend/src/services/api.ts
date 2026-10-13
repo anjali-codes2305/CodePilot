@@ -59,6 +59,7 @@ export async function createRoom(payload: {
   hostName: string;
   isPrivate?: boolean;
   passcode?: string;
+  hostId?: string;
 }) {
   const res = await fetch(`${API_BASE}/api/rooms`, {
     method: 'POST',

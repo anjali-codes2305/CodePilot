@@ -17,11 +17,15 @@ import { generatePracticeQuiz, generateInterviewQuestions } from '../practiceSer
 import { normalizeAnalysisResponse } from '../analyzer/responseNormalizer.js';
 import { analyzeCode, chat } from '../aiService.js';
 import { routeQuestion } from '../smartRouter.js';
+import crypto from 'node:crypto';
 
 let ioInstance = null;
 
-// Track socket to client mapping: socketId -> { clientId, roomId, userName }
+// Track socket to client mapping: socketId -> { clientId, roomId, userName, role }
 const socketRegistry = new Map();
+
+// Track pending join requests: requestId -> { requestId, roomId, roomName, clientId, socketId, userName, passcode, timestamp }
+const pendingJoinRequests = new Map();
 
 export function initSocketServer(httpServer, corsOptions = {}) {
   const io = new Server(httpServer, {
@@ -46,7 +50,13 @@ export function initSocketServer(httpServer, corsOptions = {}) {
           return;
         }
 
-        const joinResult = roomService.joinRoom(roomId, {
+        const roomData = roomService.getRoom(roomId);
+        if (!roomData) {
+          if (callback) callback({ error: 'Room not found' });
+          return;
+        }
+
+        const joinResult = roomService.joinRoom(roomData.id, {
           userName: userName || 'Collaborator',
           passcode,
           clientId
@@ -54,19 +64,22 @@ export function initSocketServer(httpServer, corsOptions = {}) {
 
         const { room, member } = joinResult;
 
-        // Register socket association
+        // Register socket association with canonical room.id
         socketRegistry.set(socket.id, {
           clientId: member.clientId,
-          roomId,
+          roomId: room.id,
           userName: member.userName,
           role: member.role
         });
 
-        socket.join(roomId);
+        socket.join(room.id);
+        if (roomId !== room.id) {
+          socket.join(roomId);
+        }
 
         // Fetch latest state for initial sync
-        const allMembers = roomService.getRoomMembers(roomId);
-        const messages = roomService.getRoomMessages(roomId, 100);
+        const allMembers = roomService.getRoomMembers(room.id);
+        const messages = roomService.getRoomMessages(room.id, 100);
 
         const responsePayload = {
           success: true,
@@ -82,13 +95,309 @@ export function initSocketServer(httpServer, corsOptions = {}) {
         if (callback) callback(responsePayload);
 
         // Notify other room members of the new collaborator
-        socket.to(roomId).emit('member:joined', {
+        socket.to(room.id).emit('member:joined', {
           member,
+          members: allMembers
+        });
+        io.to(room.id).emit('room:members_updated', {
           members: allMembers
         });
 
       } catch (err) {
         console.error(`[Socket room:join] Error for socket ${socket.id}:`, err.message);
+        if (callback) callback({ error: err.message });
+      }
+    });
+
+    // ─── 1b. Request to Join Room (Host Knock & Security Approval Flow) ───
+    socket.on('room:request_join', ({ roomId, clientId, userName, passcode }, callback) => {
+      try {
+        if (!roomId || typeof roomId !== 'string' || !roomId.trim()) {
+          if (callback) callback({ error: 'Please enter a valid room code or passcode' });
+          return;
+        }
+
+        const room = roomService.getRoom(roomId);
+        if (!room) {
+          if (callback) callback({ error: 'Room not found. Please verify the room code.' });
+          return;
+        }
+
+        const resolvedRoomId = room.id;
+        const upperRoomId = resolvedRoomId.toUpperCase();
+
+        // Find active host socket(s) for this room
+        const hostSockets = new Set();
+
+        // 1. Check socketRegistry by canonical room & role/clientId/userName
+        for (const [sId, info] of socketRegistry.entries()) {
+          const infoRoomUpper = (info.roomId || '').toUpperCase();
+          if (infoRoomUpper === upperRoomId) {
+            if (info.role === 'host' || info.clientId === room.hostId || (room.hostName && info.userName === room.hostName)) {
+              hostSockets.add(sId);
+            }
+          } else if (info.clientId === room.hostId) {
+            // Sockets belonging to the room host
+            hostSockets.add(sId);
+          }
+        }
+
+        // 2. Check Socket.IO adapter rooms for active sockets in this room
+        const adapterSockets = io.sockets.adapter.rooms.get(resolvedRoomId)
+          || io.sockets.adapter.rooms.get(upperRoomId);
+        if (adapterSockets && adapterSockets.size > 0) {
+          for (const sId of adapterSockets) {
+            const info = socketRegistry.get(sId);
+            if (info) {
+              if (info.role === 'host' || info.clientId === room.hostId || (room.hostName && info.userName === room.hostName)) {
+                hostSockets.add(sId);
+              }
+            }
+          }
+        }
+
+        const hostSocketsList = Array.from(hostSockets);
+        if (hostSocketsList.length === 0) {
+          if (callback) callback({ error: `The room host (${room.hostName || 'Host'}) is currently offline. Cannot join right now.` });
+          return;
+        }
+
+        // Remove any prior pending request for this socket
+        for (const [existingReqId, existingReq] of pendingJoinRequests.entries()) {
+          if (existingReq.socketId === socket.id) {
+            pendingJoinRequests.delete(existingReqId);
+          }
+        }
+
+        const requestId = crypto.randomUUID();
+        const requestData = {
+          requestId,
+          roomId: resolvedRoomId,
+          roomName: room.name,
+          clientId: clientId || crypto.randomUUID(),
+          socketId: socket.id,
+          userName: (userName || 'Collaborator').trim(),
+          passcode: passcode || roomId.trim(),
+          timestamp: Date.now()
+        };
+
+        pendingJoinRequests.set(requestId, requestData);
+
+        // Notify all active hosts for this room
+        for (const hSocketId of hostSocketsList) {
+          io.to(hSocketId).emit('join_request:incoming', {
+            requestId,
+            roomId: resolvedRoomId,
+            roomName: room.name,
+            userName: requestData.userName,
+            clientId: requestData.clientId,
+            timestamp: requestData.timestamp
+          });
+        }
+
+        if (callback) callback({
+          success: true,
+          waiting: true,
+          requestId,
+          roomId: resolvedRoomId,
+          roomName: room.name
+        });
+      } catch (err) {
+        console.error('[Socket room:request_join] Error:', err.message);
+        if (callback) callback({ error: err.message });
+      }
+    });
+
+    // ─── 1c. Cancel Pending Join Request ───
+    socket.on('join_request:cancel', ({ requestId }, callback) => {
+      const req = pendingJoinRequests.get(requestId);
+      if (req) {
+        pendingJoinRequests.delete(requestId);
+        const reqRoomUpper = (req.roomId || '').toUpperCase();
+        for (const [sId, info] of socketRegistry.entries()) {
+          if ((info.roomId || '').toUpperCase() === reqRoomUpper && (info.role === 'host')) {
+            io.to(sId).emit('join_request:cancelled', { requestId });
+          }
+        }
+      }
+      if (callback) callback({ success: true });
+    });
+
+    // ─── 1d. Host Approval / Rejection ───
+    socket.on('join_request:respond', ({ requestId, approved }, callback) => {
+      try {
+        const hostInfo = socketRegistry.get(socket.id);
+        const req = pendingJoinRequests.get(requestId);
+
+        if (!req) {
+          if (callback) callback({ error: 'Join request expired or was cancelled.' });
+          return;
+        }
+
+        const room = roomService.getRoom(req.roomId);
+        const canonicalRoomId = room ? room.id : req.roomId;
+        const upperRoomId = canonicalRoomId.toUpperCase();
+
+        const isHost = hostInfo && (
+          (hostInfo.role === 'host') ||
+          (room && hostInfo.clientId === room.hostId)
+        ) && (
+          (hostInfo.roomId || '').toUpperCase() === upperRoomId ||
+          (room && (hostInfo.roomId || '').toUpperCase() === room.id.toUpperCase())
+        );
+
+        if (!isHost) {
+          if (callback) callback({ error: 'Only the room host can approve or reject join requests.' });
+          return;
+        }
+
+        pendingJoinRequests.delete(requestId);
+
+        // Notify all host sockets for this room that the request has been handled
+        for (const [sId, info] of socketRegistry.entries()) {
+          if ((info.roomId || '').toUpperCase() === upperRoomId && (info.role === 'host' || (room && info.clientId === room.hostId))) {
+            io.to(sId).emit('join_request:handled', { requestId, approved: Boolean(approved) });
+          }
+        }
+
+        const requesterSocket = io.sockets.sockets.get(req.socketId);
+
+        if (approved) {
+          let joinResult;
+          try {
+            joinResult = roomService.joinRoom(canonicalRoomId, {
+              userName: req.userName,
+              clientId: req.clientId,
+              passcode: req.passcode
+            });
+          } catch {
+            // Passcode bypass if host explicitly approved
+            joinResult = roomService.joinRoom(canonicalRoomId, {
+              userName: req.userName,
+              clientId: req.clientId
+            });
+          }
+
+          const { room: joinedRoom, member } = joinResult;
+
+          if (requesterSocket) {
+            socketRegistry.set(requesterSocket.id, {
+              clientId: member.clientId,
+              roomId: canonicalRoomId,
+              userName: member.userName,
+              role: member.role
+            });
+
+            requesterSocket.join(canonicalRoomId);
+
+            const allMembers = roomService.getRoomMembers(canonicalRoomId);
+            const messages = roomService.getRoomMessages(canonicalRoomId, 100);
+
+            const payload = {
+              success: true,
+              room: joinedRoom,
+              member,
+              members: allMembers,
+              messages,
+              code: joinedRoom.code,
+              codeVersion: joinedRoom.codeVersion,
+              latestAnalysis: joinedRoom.latestAnalysis
+            };
+
+            requesterSocket.emit('join_request:approved', payload);
+
+            requesterSocket.to(canonicalRoomId).emit('member:joined', {
+              member,
+              members: allMembers
+            });
+
+            io.to(canonicalRoomId).emit('room:members_updated', {
+              members: allMembers
+            });
+          }
+
+          if (callback) callback({ success: true, approved: true });
+        } else {
+          if (requesterSocket) {
+            requesterSocket.emit('join_request:rejected', {
+              reason: 'The host has declined your request to join the room.'
+            });
+          }
+          if (callback) callback({ success: true, approved: false });
+        }
+      } catch (err) {
+        console.error('[Socket join_request:respond] Error:', err.message);
+        if (callback) callback({ error: err.message });
+      }
+    });
+
+    // ─── 1e. List Pending Join Requests (Host query) ───
+    socket.on('join_requests:list', ({ roomId }, callback) => {
+      const list = [];
+      for (const req of pendingJoinRequests.values()) {
+        if (req.roomId === roomId) {
+          list.push({
+            requestId: req.requestId,
+            roomId: req.roomId,
+            roomName: req.roomName,
+            userName: req.userName,
+            clientId: req.clientId,
+            timestamp: req.timestamp
+          });
+        }
+      }
+      if (callback) callback({ requests: list });
+    });
+
+    // ─── 1f. Explicit Room Leave ───
+    socket.on('room:leave', ({ roomId, clientId, userName }, callback) => {
+      try {
+        const socketInfo = socketRegistry.get(socket.id);
+        const targetRoomId = roomId || socketInfo?.roomId;
+        const targetClientId = clientId || socketInfo?.clientId;
+        const targetUserName = userName || socketInfo?.userName || 'A collaborator';
+
+        if (!targetRoomId || !targetClientId) {
+          if (callback) callback({ error: 'Missing roomId or clientId' });
+          return;
+        }
+
+        socketRegistry.delete(socket.id);
+        socket.leave(targetRoomId);
+
+        roomService.setMemberPresence(targetRoomId, targetClientId, false);
+        const updatedMembers = roomService.getRoomMembers(targetRoomId);
+
+        // Record and broadcast system message to room chat
+        try {
+          const sysMsg = roomService.addRoomMessage(targetRoomId, {
+            senderId: 'system',
+            senderName: 'System',
+            senderRole: 'system',
+            content: `${targetUserName} left the room.`,
+            type: 'system'
+          });
+          io.to(targetRoomId).emit('chat:message', sysMsg);
+        } catch (e) {
+          console.error('[Socket room:leave] Message error:', e.message);
+        }
+
+        io.to(targetRoomId).emit('presence:changed', {
+          clientId: targetClientId,
+          userName: targetUserName,
+          isOnline: false,
+          members: updatedMembers
+        });
+
+        io.to(targetRoomId).emit('member:left', {
+          clientId: targetClientId,
+          userName: targetUserName,
+          members: updatedMembers
+        });
+
+        if (callback) callback({ success: true });
+      } catch (err) {
+        console.error('[Socket room:leave] Error:', err.message);
         if (callback) callback({ error: err.message });
       }
     });
@@ -428,15 +737,47 @@ export function initSocketServer(httpServer, corsOptions = {}) {
           if (!hasOtherSockets) {
             roomService.setMemberPresence(roomId, clientId, false);
             const updatedMembers = roomService.getRoomMembers(roomId);
+
+            try {
+              const sysMsg = roomService.addRoomMessage(roomId, {
+                senderId: 'system',
+                senderName: 'System',
+                senderRole: 'system',
+                content: `${userName} left the room.`,
+                type: 'system'
+              });
+              io.to(roomId).emit('chat:message', sysMsg);
+            } catch (e) {
+              console.error('[Socket disconnect] Message error:', e.message);
+            }
+
             io.to(roomId).emit('presence:changed', {
               clientId,
               userName,
               isOnline: false,
               members: updatedMembers
             });
+
+            io.to(roomId).emit('member:left', {
+              clientId,
+              userName,
+              members: updatedMembers
+            });
           }
         } catch (e) {
           console.error('[Socket disconnect] Presence update error:', e.message);
+        }
+      }
+
+      // Clean up any pending join requests initiated by this socket
+      for (const [reqId, req] of pendingJoinRequests.entries()) {
+        if (req.socketId === socket.id) {
+          pendingJoinRequests.delete(reqId);
+          for (const [sId, info] of socketRegistry.entries()) {
+            if (info.roomId === req.roomId && info.role === 'host') {
+              io.to(sId).emit('join_request:cancelled', { requestId: reqId });
+            }
+          }
         }
       }
     });

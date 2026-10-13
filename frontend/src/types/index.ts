@@ -305,3 +305,12 @@ export interface PublicRoomItem {
   updatedAt: number;
 }
 
+export interface JoinRequestNotification {
+  requestId: string;
+  roomId: string;
+  roomName: string;
+  userName: string;
+  clientId: string;
+  timestamp: number;
+}
+

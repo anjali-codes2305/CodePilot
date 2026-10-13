@@ -10,6 +10,9 @@ const SERVER_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
 class RealtimeRoomService {
   private socket: Socket | null = null;
   private currentRoomId: string | null = null;
+  private currentClientId: string | null = null;
+  private currentUserName: string | null = null;
+  private currentPasscode?: string;
   private connectionStatusListeners: Set<(connected: boolean) => void> = new Set();
 
   public isConnected(): boolean {
@@ -28,6 +31,22 @@ class RealtimeRoomService {
 
       this.socket.on('connect', () => {
         this.notifyConnectionStatus(true);
+        // Automatically re-join room if client was in a room before connection dropped/reconnected
+        const activeRoomId = this.currentRoomId || localStorage.getItem('codepilot_active_room_id');
+        const activeClientId = this.currentClientId || localStorage.getItem('codepilot_client_id');
+        const activeUserName = this.currentUserName || localStorage.getItem('codepilot_user_name') || 'Collaborator';
+
+        if (activeRoomId && activeClientId) {
+          this.currentRoomId = activeRoomId;
+          this.currentClientId = activeClientId;
+          this.currentUserName = activeUserName;
+          this.socket?.emit('room:join', {
+            roomId: activeRoomId,
+            clientId: activeClientId,
+            userName: activeUserName,
+            passcode: this.currentPasscode
+          });
+        }
       });
 
       this.socket.on('disconnect', () => {
@@ -73,6 +92,9 @@ class RealtimeRoomService {
     latestAnalysis?: AnalyzeResponse | null;
   }> {
     this.currentRoomId = roomId;
+    this.currentClientId = clientId;
+    this.currentUserName = userName;
+    this.currentPasscode = passcode;
     const socket = this.getSocket();
 
     return new Promise((resolve, reject) => {
@@ -82,6 +104,61 @@ class RealtimeRoomService {
         } else {
           resolve(response);
         }
+      });
+    });
+  }
+
+  public requestJoinRoom(
+    roomId: string,
+    clientId: string,
+    userName: string,
+    passcode?: string
+  ): Promise<{
+    success: boolean;
+    waiting: boolean;
+    requestId: string;
+    roomId: string;
+    roomName: string;
+  }> {
+    const socket = this.getSocket();
+    return new Promise((resolve, reject) => {
+      socket.emit('room:request_join', { roomId, clientId, userName, passcode }, (response: any) => {
+        if (!response || response.error) {
+          reject(new Error(response?.error || 'Failed to request room entry'));
+        } else {
+          resolve(response);
+        }
+      });
+    });
+  }
+
+  public cancelJoinRequest(requestId: string): Promise<void> {
+    const socket = this.getSocket();
+    return new Promise((resolve) => {
+      socket.emit('join_request:cancel', { requestId }, () => {
+        resolve();
+      });
+    });
+  }
+
+  public respondJoinRequest(requestId: string, approved: boolean): Promise<{ success: boolean; approved: boolean }> {
+    const socket = this.getSocket();
+    return new Promise((resolve, reject) => {
+      socket.emit('join_request:respond', { requestId, approved }, (res: any) => {
+        if (res?.error) {
+          reject(new Error(res.error));
+        } else {
+          resolve(res);
+        }
+      });
+    });
+  }
+
+  public getPendingJoinRequests(roomId: string): Promise<{ requests: any[] }> {
+    const socket = this.getSocket();
+    return new Promise((resolve) => {
+      socket.emit('join_requests:list', { roomId }, (res: any) => {
+        resolve(res || { requests: [] });
       });
     });
   }
@@ -169,11 +246,26 @@ class RealtimeRoomService {
     }
   }
 
-  public leaveRoom() {
-    if (this.socket && this.currentRoomId) {
+  public leaveRoom(roomId?: string, clientId?: string, userName?: string) {
+    const targetRoom = roomId || this.currentRoomId;
+    if (this.socket && this.socket.connected && targetRoom) {
+      try {
+        this.socket.emit('room:leave', {
+          roomId: targetRoom,
+          clientId,
+          userName
+        });
+      } catch (e) {
+        console.warn('Error emitting room:leave:', e);
+      }
+    }
+    this.currentRoomId = null;
+    this.currentClientId = null;
+    this.currentUserName = null;
+    this.currentPasscode = undefined;
+    if (this.socket) {
       this.socket.disconnect();
       this.socket = null;
-      this.currentRoomId = null;
       this.notifyConnectionStatus(false);
     }
   }

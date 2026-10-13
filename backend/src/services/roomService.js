@@ -44,11 +44,12 @@ export function createRoom({
   hostName = 'Host',
   isPrivate = false,
   passcode = null,
-  settings = {}
+  settings = {},
+  hostId = null
 }) {
   const db = getDatabase();
   const roomId = generateRoomId();
-  const hostId = crypto.randomUUID();
+  const effectiveHostId = hostId || crypto.randomUUID();
   const now = Date.now();
 
   const insertRoom = db.prepare(`
@@ -69,7 +70,7 @@ export function createRoom({
     initialCode,
     language,
     mode,
-    hostId,
+    effectiveHostId,
     hostName.trim(),
     isPrivate ? 1 : 0,
     passcode ? passcode.trim() : null,
@@ -92,7 +93,7 @@ export function createRoom({
   insertMember.run(
     memberId,
     roomId,
-    hostId,
+    effectiveHostId,
     hostName.trim(),
     'host',
     '#06b6d4',
@@ -113,7 +114,7 @@ export function createRoom({
     roomId,
     1,
     initialCode,
-    hostId,
+    effectiveHostId,
     hostName.trim(),
     now
   );
@@ -140,7 +141,7 @@ export function createRoom({
   return {
     room: getRoom(roomId),
     hostMember: {
-      clientId: hostId,
+      clientId: effectiveHostId,
       userName: hostName.trim(),
       role: 'host',
       avatarColor: '#06b6d4'
@@ -149,12 +150,24 @@ export function createRoom({
 }
 
 /**
- * Gets a room by ID with parsed JSON fields.
+ * Gets a room by ID with case/prefix tolerance and parsed JSON fields.
  */
 export function getRoom(roomId) {
+  if (!roomId || typeof roomId !== 'string') return null;
   const db = getDatabase();
-  const stmt = db.prepare('SELECT * FROM rooms WHERE id = ?');
-  const row = stmt.get(roomId);
+  const trimmed = roomId.trim();
+  const upper = trimmed.toUpperCase();
+  const withPrefix = upper.startsWith('ROOM-') ? upper : `ROOM-${upper}`;
+
+  const stmt = db.prepare(`
+    SELECT * FROM rooms 
+    WHERE id = ? 
+       OR id = ? 
+       OR UPPER(id) = ? 
+       OR UPPER(id) = ?
+    LIMIT 1
+  `);
+  const row = stmt.get(trimmed, withPrefix, upper, withPrefix);
   if (!row) return null;
 
   return {
@@ -210,15 +223,19 @@ export function listPublicRooms() {
  */
 export function joinRoom(roomId, { userName, passcode = null, clientId = null }) {
   const db = getDatabase();
-  const roomRow = db.prepare('SELECT * FROM rooms WHERE id = ?').get(roomId);
-  if (!roomRow) {
+  const room = getRoom(roomId);
+  if (!room) {
     throw new Error('Room not found');
   }
+  const canonicalRoomId = room.id;
 
   // Passcode verification
-  if (roomRow.passcode) {
-    if (!passcode || passcode.trim() !== roomRow.passcode) {
-      throw new Error('Invalid room passcode');
+  if (room.hasPasscode) {
+    const roomRow = db.prepare('SELECT passcode FROM rooms WHERE id = ?').get(canonicalRoomId);
+    if (roomRow && roomRow.passcode) {
+      if (!passcode || passcode.trim() !== roomRow.passcode) {
+        throw new Error('Invalid room passcode');
+      }
     }
   }
 
@@ -229,23 +246,23 @@ export function joinRoom(roomId, { userName, passcode = null, clientId = null })
   // Check if member already exists in room
   const existingMember = db.prepare(`
     SELECT * FROM room_members WHERE room_id = ? AND client_id = ?
-  `).get(roomId, effectiveClientId);
+  `).get(canonicalRoomId, effectiveClientId);
 
   let memberRole = 'editor';
   let avatarColor = getRandomColor();
 
   if (existingMember) {
-    memberRole = existingMember.role;
+    memberRole = (effectiveClientId === room.hostId) ? 'host' : existingMember.role;
     avatarColor = existingMember.avatar_color;
 
     db.prepare(`
       UPDATE room_members
-      SET is_online = 1, last_active_at = ?, user_name = ?
+      SET is_online = 1, last_active_at = ?, user_name = ?, role = ?
       WHERE id = ?
-    `).run(now, cleanName, existingMember.id);
+    `).run(now, cleanName, memberRole, existingMember.id);
   } else {
     // If user is the recorded host_id, grant host role
-    if (effectiveClientId === roomRow.host_id) {
+    if (effectiveClientId === room.hostId) {
       memberRole = 'host';
     }
 
@@ -256,7 +273,7 @@ export function joinRoom(roomId, { userName, passcode = null, clientId = null })
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       crypto.randomUUID(),
-      roomId,
+      canonicalRoomId,
       effectiveClientId,
       cleanName,
       memberRole,
@@ -273,7 +290,7 @@ export function joinRoom(roomId, { userName, passcode = null, clientId = null })
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       crypto.randomUUID(),
-      roomId,
+      canonicalRoomId,
       'system',
       'System',
       'system',
@@ -284,7 +301,7 @@ export function joinRoom(roomId, { userName, passcode = null, clientId = null })
   }
 
   return {
-    room: getRoom(roomId),
+    room: getRoom(canonicalRoomId),
     member: {
       clientId: effectiveClientId,
       userName: cleanName,
@@ -300,6 +317,8 @@ export function joinRoom(roomId, { userName, passcode = null, clientId = null })
  */
 export function getRoomMembers(roomId) {
   const db = getDatabase();
+  const room = getRoom(roomId);
+  const targetId = room ? room.id : roomId;
   const stmt = db.prepare(`
     SELECT client_id, user_name, role, avatar_color, joined_at, last_active_at, is_online
     FROM room_members
@@ -307,7 +326,7 @@ export function getRoomMembers(roomId) {
     ORDER BY joined_at ASC
   `);
 
-  return stmt.all(roomId).map(m => ({
+  return stmt.all(targetId).map(m => ({
     clientId: m.client_id,
     userName: m.user_name,
     role: m.role,
@@ -323,9 +342,10 @@ export function getRoomMembers(roomId) {
  */
 export function updateMemberRole(roomId, hostClientId, targetClientId, newRole) {
   const db = getDatabase();
-  const room = db.prepare('SELECT host_id FROM rooms WHERE id = ?').get(roomId);
+  const room = getRoom(roomId);
   if (!room) throw new Error('Room not found');
-  if (room.host_id !== hostClientId) {
+  const targetId = room.id;
+  if (room.hostId !== hostClientId) {
     throw new Error('Only the room host can change member permissions');
   }
 
@@ -335,17 +355,17 @@ export function updateMemberRole(roomId, hostClientId, targetClientId, newRole) 
 
   if (newRole === 'host') {
     // Transfer ownership
-    db.prepare('UPDATE rooms SET host_id = ? WHERE id = ?').run(targetClientId, roomId);
-    db.prepare("UPDATE room_members SET role = 'editor' WHERE room_id = ? AND client_id = ?").run(roomId, hostClientId);
-    db.prepare("UPDATE room_members SET role = 'host' WHERE room_id = ? AND client_id = ?").run(roomId, targetClientId);
+    db.prepare('UPDATE rooms SET host_id = ? WHERE id = ?').run(targetClientId, targetId);
+    db.prepare("UPDATE room_members SET role = 'editor' WHERE room_id = ? AND client_id = ?").run(targetId, hostClientId);
+    db.prepare("UPDATE room_members SET role = 'host' WHERE room_id = ? AND client_id = ?").run(targetId, targetClientId);
   } else {
-    if (targetClientId === room.host_id) {
+    if (targetClientId === room.hostId) {
       throw new Error('Cannot demote room host without transferring ownership');
     }
-    db.prepare('UPDATE room_members SET role = ? WHERE room_id = ? AND client_id = ?').run(newRole, roomId, targetClientId);
+    db.prepare('UPDATE room_members SET role = ? WHERE room_id = ? AND client_id = ?').run(newRole, targetId, targetClientId);
   }
 
-  return getRoomMembers(roomId);
+  return getRoomMembers(targetId);
 }
 
 /**
@@ -353,12 +373,14 @@ export function updateMemberRole(roomId, hostClientId, targetClientId, newRole) 
  */
 export function setMemberPresence(roomId, clientId, isOnline) {
   const db = getDatabase();
+  const room = getRoom(roomId);
+  const targetId = room ? room.id : roomId;
   const now = Date.now();
   db.prepare(`
     UPDATE room_members
     SET is_online = ?, last_active_at = ?
     WHERE room_id = ? AND client_id = ?
-  `).run(isOnline ? 1 : 0, now, roomId, clientId);
+  `).run(isOnline ? 1 : 0, now, targetId, clientId);
 }
 
 /**

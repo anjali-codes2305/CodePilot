@@ -10,7 +10,7 @@ const router = Router();
 // Create room
 router.post('/', (req, res) => {
   try {
-    const { name, code, language, mode, hostName, isPrivate, passcode, settings } = req.body;
+    const { name, code, language, mode, hostName, isPrivate, passcode, settings, hostId } = req.body;
     const result = roomService.createRoom({
       name,
       code,
@@ -19,7 +19,8 @@ router.post('/', (req, res) => {
       hostName,
       isPrivate: Boolean(isPrivate),
       passcode,
-      settings
+      settings,
+      hostId
     });
 
     return res.status(201).json(result);

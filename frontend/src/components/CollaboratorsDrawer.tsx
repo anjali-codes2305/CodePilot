@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
-import type { RoomState, RoomMember, RoomMessage, RoomRole } from '../types';
+import type { RoomState, RoomMember, RoomMessage, RoomRole, JoinRequestNotification } from '../types';
 
 interface CollaboratorsDrawerProps {
   isOpen: boolean;
@@ -11,6 +11,8 @@ interface CollaboratorsDrawerProps {
   messages: RoomMessage[];
   isConnected: boolean;
   isAiThinking: boolean;
+  pendingRequests?: JoinRequestNotification[];
+  onRespondJoinRequest?: (requestId: string, approved: boolean) => void;
   onSendMessage: (content: string, askPilot?: boolean) => void;
   onChangeRole: (targetClientId: string, newRole: RoomRole) => void;
   onLeaveRoom: () => void;
@@ -27,6 +29,8 @@ export default function CollaboratorsDrawer({
   messages,
   isConnected,
   isAiThinking,
+  pendingRequests = [],
+  onRespondJoinRequest,
   onSendMessage,
   onChangeRole,
   onLeaveRoom,
@@ -272,64 +276,116 @@ export default function CollaboratorsDrawer({
 
         {/* TAB: MEMBERS */}
         {activeTab === 'members' && (
-          <div className="p-3 flex flex-col gap-2">
-            <div className="text-[11px] text-gray-400 font-medium px-1">
-              Room Participants ({members.length})
+          <div className="p-3 flex flex-col gap-3">
+            {isHost && pendingRequests.length > 0 && onRespondJoinRequest && (
+              <div className="p-3 rounded-xl bg-cyan-950/40 border border-cyan-800/80 flex flex-col gap-2">
+                <div className="flex items-center justify-between text-xs font-bold text-cyan-300">
+                  <span className="flex items-center gap-1.5">
+                    <span className="w-2 h-2 rounded-full bg-cyan-400 animate-ping" />
+                    Join Requests ({pendingRequests.length})
+                  </span>
+                </div>
+                <div className="flex flex-col gap-2">
+                  {pendingRequests.map((req) => (
+                    <div key={req.requestId} className="flex items-center justify-between p-2 rounded-lg bg-gray-900/90 border border-gray-800">
+                      <div className="flex flex-col">
+                        <span className="text-xs font-bold text-white">{req.userName}</span>
+                        <span className="text-[10px] text-gray-400">Waiting for approval</span>
+                      </div>
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          onClick={() => onRespondJoinRequest(req.requestId, false)}
+                          className="px-2 py-1 rounded bg-rose-950/60 hover:bg-rose-900 text-rose-300 border border-rose-800/60 text-[10px] font-semibold cursor-pointer"
+                        >
+                          Reject
+                        </button>
+                        <button
+                          onClick={() => onRespondJoinRequest(req.requestId, true)}
+                          className="px-2 py-1 rounded bg-cyan-600 hover:bg-cyan-500 text-white text-[10px] font-bold cursor-pointer shadow-sm"
+                        >
+                          Accept
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <div className="flex items-center justify-between text-[11px] text-gray-400 font-medium px-1">
+              <span>Room Participants ({members.length})</span>
+              <span className="text-emerald-400 font-mono font-bold flex items-center gap-1.5">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                {members.filter(m => m.isOnline).length} Online
+              </span>
             </div>
 
             <div className="flex flex-col gap-2">
-              {members.map((member) => {
-                const isMe = member.clientId === currentClientId;
-                return (
-                  <div
-                    key={member.clientId}
-                    className="flex items-center justify-between p-2.5 rounded-xl bg-gray-900/70 border border-gray-800"
-                  >
-                    <div className="flex items-center gap-2.5">
-                      <div
-                        className="w-7 h-7 rounded-lg flex items-center justify-center font-bold text-xs text-white shadow-sm"
-                        style={{ backgroundColor: member.avatarColor }}
-                      >
-                        {member.userName.charAt(0).toUpperCase()}
-                      </div>
-                      <div className="flex flex-col">
-                        <span className="font-semibold text-xs text-white flex items-center gap-1.5">
-                          {member.userName}
-                          {isMe && <span className="text-[10px] text-cyan-400 font-normal">(You)</span>}
-                        </span>
-                        <div className="flex items-center gap-1.5 text-[10px] text-gray-400">
-                          <span className={`w-1.5 h-1.5 rounded-full ${member.isOnline ? 'bg-emerald-400' : 'bg-gray-600'}`} />
-                          <span>{member.isOnline ? 'Online' : 'Offline'}</span>
+              {[...members]
+                .sort((a, b) => (b.isOnline ? 1 : 0) - (a.isOnline ? 1 : 0))
+                .map((member) => {
+                  const isMe = member.clientId === currentClientId;
+                  return (
+                    <div
+                      key={member.clientId}
+                      className={`flex items-center justify-between p-2.5 rounded-xl border transition-all ${
+                        member.isOnline
+                          ? 'bg-gray-900/80 border-gray-800'
+                          : 'bg-gray-950/40 border-gray-900 opacity-60'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2.5">
+                        <div
+                          className="relative w-7 h-7 rounded-lg flex items-center justify-center font-bold text-xs text-white shadow-sm"
+                          style={{ backgroundColor: member.isOnline ? member.avatarColor : '#374151' }}
+                        >
+                          {member.userName.charAt(0).toUpperCase()}
+                          <span
+                            className={`absolute -bottom-0.5 -right-0.5 w-2 h-2 rounded-full border border-[#090d16] ${
+                              member.isOnline ? 'bg-emerald-400' : 'bg-rose-500'
+                            }`}
+                          />
+                        </div>
+                        <div className="flex flex-col">
+                          <span className={`font-semibold text-xs flex items-center gap-1.5 ${member.isOnline ? 'text-white' : 'text-gray-400'}`}>
+                            {member.userName}
+                            {isMe && <span className="text-[10px] text-cyan-400 font-normal">(You)</span>}
+                          </span>
+                          <div className="flex items-center gap-1.5 text-[10px]">
+                            <span className={`w-1.5 h-1.5 rounded-full ${member.isOnline ? 'bg-emerald-400 animate-pulse' : 'bg-rose-500'}`} />
+                            <span className={member.isOnline ? 'text-emerald-400 font-medium' : 'text-rose-400/90 font-medium'}>
+                              {member.isOnline ? 'Online' : 'Offline (Left)'}
+                            </span>
+                          </div>
                         </div>
                       </div>
-                    </div>
 
-                    <div className="flex items-center gap-1.5">
-                      {/* Role Badge */}
-                      <span className={`text-[10px] font-mono px-2 py-0.5 rounded-full font-bold ${
-                        member.role === 'host'
-                          ? 'bg-amber-950 text-amber-300 border border-amber-800'
-                          : member.role === 'editor'
-                          ? 'bg-cyan-950 text-cyan-300 border border-cyan-800'
-                          : 'bg-gray-800 text-gray-400 border border-gray-700'
-                      }`}>
-                        {member.role === 'host' ? '👑 Host' : member.role === 'editor' ? '✏️ Editor' : '👁️ Viewer'}
-                      </span>
+                      <div className="flex items-center gap-1.5">
+                        {/* Role Badge */}
+                        <span className={`text-[10px] font-mono px-2 py-0.5 rounded-full font-bold ${
+                          member.role === 'host'
+                            ? 'bg-amber-950 text-amber-300 border border-amber-800'
+                            : member.role === 'editor'
+                            ? 'bg-cyan-950 text-cyan-300 border border-cyan-800'
+                            : 'bg-gray-800 text-gray-400 border border-gray-700'
+                        }`}>
+                          {member.role === 'host' ? '👑 Host' : member.role === 'editor' ? '✏️ Editor' : '👁️ Viewer'}
+                        </span>
 
-                      {/* Host can toggle roles */}
-                      {isHost && !isMe && member.role !== 'host' && (
-                        <button
-                          onClick={() => onChangeRole(member.clientId, member.role === 'editor' ? 'viewer' : 'editor')}
-                          className="text-[10px] px-2 py-0.5 rounded bg-gray-800 hover:bg-gray-700 text-gray-300 cursor-pointer transition-colors"
-                          title="Toggle Editor / Viewer permission"
-                        >
-                          {member.role === 'editor' ? 'Make Viewer' : 'Make Editor'}
-                        </button>
-                      )}
+                        {/* Host can toggle roles if user is online */}
+                        {isHost && !isMe && member.role !== 'host' && (
+                          <button
+                            onClick={() => onChangeRole(member.clientId, member.role === 'editor' ? 'viewer' : 'editor')}
+                            className="text-[10px] px-2 py-0.5 rounded bg-gray-800 hover:bg-gray-700 text-gray-300 cursor-pointer transition-colors"
+                            title="Toggle Editor / Viewer permission"
+                          >
+                            {member.role === 'editor' ? 'Make Viewer' : 'Make Editor'}
+                          </button>
+                        )}
+                      </div>
                     </div>
-                  </div>
-                );
-              })}
+                  );
+                })}
             </div>
           </div>
         )}

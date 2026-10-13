@@ -13,7 +13,8 @@ import type {
   RoomMember,
   RoomMessage,
   PeerCursor,
-  RoomRole
+  RoomRole,
+  JoinRequestNotification
 } from './types';
 import {
   analyzeCode,
@@ -168,6 +169,7 @@ export default function App() {
   const [isAiThinking, setIsAiThinking] = useState(false);
   const [roomNotification, setRoomNotification] = useState<string | null>(null);
   const [conflictBanner, setConflictBanner] = useState<string | null>(null);
+  const [pendingJoinRequests, setPendingJoinRequests] = useState<JoinRequestNotification[]>([]);
 
   // Track client ID in localStorage
   const clientIdRef = useRef<string>(
@@ -179,12 +181,43 @@ export default function App() {
     })()
   );
 
-  // Auto-check URL query parameters for ?room=ROOM-XYZ
+  // Auto-check URL query parameters for ?room=ROOM-XYZ or restore active session
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const roomParam = params.get('room');
     if (roomParam) {
       setIsRoomModalOpen(true);
+      return;
+    }
+
+    const savedRoomId = localStorage.getItem('codepilot_active_room_id');
+    const savedClientId = localStorage.getItem('codepilot_client_id') || clientIdRef.current;
+    const savedUserName = localStorage.getItem('codepilot_user_name') || 'Host';
+
+    if (savedRoomId && savedClientId) {
+      realtimeService.joinRoom(savedRoomId, savedClientId, savedUserName)
+        .then((joinData) => {
+          setActiveRoom(joinData.room);
+          setCurrentMember(joinData.member);
+          setRoomMembers(joinData.members);
+          setRoomMessages(joinData.messages);
+          setCode(joinData.code);
+          setLanguage(joinData.room.language);
+          setMode(joinData.room.mode as LearningMode);
+
+          if (joinData.latestAnalysis) {
+            setAnalysis(joinData.latestAnalysis.analysis);
+            setStructuredSections(joinData.latestAnalysis.structuredSections);
+            setCodeAnalysis(joinData.latestAnalysis.codeAnalysis || null);
+            setExecutionTrace(joinData.latestAnalysis.executionTrace || null);
+            setPracticeQuiz(joinData.latestAnalysis.practiceQuiz || []);
+            setInterviewQuestions(joinData.latestAnalysis.interviewQuestions || []);
+          }
+        })
+        .catch((err) => {
+          console.warn('[Auto-rejoin error]:', err.message);
+          localStorage.removeItem('codepilot_active_room_id');
+        });
     }
   }, []);
 
@@ -253,7 +286,23 @@ export default function App() {
       setRoomMembers(payload.members);
       if (!payload.isOnline) {
         setPeerCursors((prev) => prev.filter((p) => p.clientId !== payload.clientId));
+        setRoomNotification(`🚪 ${payload.userName} has left the room`);
+        setTimeout(() => setRoomNotification(null), 4000);
+      } else {
+        setRoomNotification(`🟢 ${payload.userName} is online`);
+        setTimeout(() => setRoomNotification(null), 3000);
       }
+    };
+
+    const handleMemberLeft = (payload: {
+      clientId: string;
+      userName: string;
+      members: RoomMember[];
+    }) => {
+      setRoomMembers(payload.members);
+      setPeerCursors((prev) => prev.filter((p) => p.clientId !== payload.clientId));
+      setRoomNotification(`🚪 ${payload.userName} has left the room`);
+      setTimeout(() => setRoomNotification(null), 4000);
     };
 
     const handleAnalysisStarted = (payload: { triggeredBy: string }) => {
@@ -321,6 +370,27 @@ export default function App() {
     realtimeService.on('view:highlighted', handleViewHighlighted);
     realtimeService.on('settings:updated', handleSettingsUpdated);
 
+    const handleJoinRequestIncoming = (req: JoinRequestNotification) => {
+      setPendingJoinRequests((prev) => {
+        if (prev.some((r) => r.requestId === req.requestId)) return prev;
+        return [...prev, req];
+      });
+      setRoomNotification(`🛡️ Join Request: ${req.userName} requested to join`);
+    };
+
+    const handleJoinRequestCancelled = (payload: { requestId: string }) => {
+      setPendingJoinRequests((prev) => prev.filter((r) => r.requestId !== payload.requestId));
+    };
+
+    const handleJoinRequestHandled = (payload: { requestId: string; approved: boolean }) => {
+      setPendingJoinRequests((prev) => prev.filter((r) => r.requestId !== payload.requestId));
+    };
+
+    realtimeService.on('join_request:incoming', handleJoinRequestIncoming);
+    realtimeService.on('join_request:cancelled', handleJoinRequestCancelled);
+    realtimeService.on('join_request:handled', handleJoinRequestHandled);
+    realtimeService.on('member:left', handleMemberLeft);
+
     return () => {
       unsubConnection();
       realtimeService.off('code:updated', handleCodeUpdated);
@@ -330,6 +400,7 @@ export default function App() {
       realtimeService.off('member:joined', handleMemberJoined);
       realtimeService.off('members:updated', handleMembersUpdated);
       realtimeService.off('presence:changed', handlePresenceChanged);
+      realtimeService.off('member:left', handleMemberLeft);
       realtimeService.off('analysis:started', handleAnalysisStarted);
       realtimeService.off('analysis:completed', handleAnalysisCompleted);
       realtimeService.off('analysis:error', handleAnalysisError);
@@ -337,6 +408,9 @@ export default function App() {
       realtimeService.off('pilot:thinking', handlePilotThinking);
       realtimeService.off('view:highlighted', handleViewHighlighted);
       realtimeService.off('settings:updated', handleSettingsUpdated);
+      realtimeService.off('join_request:incoming', handleJoinRequestIncoming);
+      realtimeService.off('join_request:cancelled', handleJoinRequestCancelled);
+      realtimeService.off('join_request:handled', handleJoinRequestHandled);
     };
   }, []);
 
@@ -598,27 +672,23 @@ export default function App() {
   // ─── Room Creation & Joining Handlers ───
   const handleCreateRoom = async (data: {
     name: string;
-    language: string;
-    mode: LearningMode;
     hostName: string;
-    isPrivate: boolean;
-    passcode?: string;
   }) => {
+    const hostClientId = clientIdRef.current;
     const res = await apiCreateRoom({
       name: data.name,
       code,
-      language: data.language,
-      mode: data.mode,
+      language,
+      mode,
       hostName: data.hostName,
-      isPrivate: data.isPrivate,
-      passcode: data.passcode
+      isPrivate: true,
+      hostId: hostClientId
     });
 
     const joinData = await realtimeService.joinRoom(
       res.room.id,
       res.hostMember.clientId,
-      data.hostName,
-      data.passcode
+      data.hostName
     );
 
     setActiveRoom(joinData.room);
@@ -628,6 +698,11 @@ export default function App() {
     setCode(joinData.code);
     setLanguage(joinData.room.language);
     setMode(joinData.room.mode as LearningMode);
+
+    localStorage.setItem('codepilot_active_room_id', joinData.room.id);
+    localStorage.setItem('codepilot_user_name', data.hostName);
+    localStorage.setItem('codepilot_client_id', res.hostMember.clientId);
+    clientIdRef.current = res.hostMember.clientId;
 
     if (joinData.latestAnalysis) {
       setAnalysis(joinData.latestAnalysis.analysis);
@@ -643,14 +718,15 @@ export default function App() {
     setRoomNotification(`🎉 Room ${joinData.room.id} created! You are the Host.`);
   };
 
-  const handleJoinRoom = async (roomId: string, userName: string, passcode?: string) => {
-    const joinData = await realtimeService.joinRoom(
-      roomId,
-      clientIdRef.current,
-      userName,
-      passcode
-    );
-
+  const handleJoinApproved = (joinData: {
+    room: RoomState;
+    member: RoomMember;
+    members: RoomMember[];
+    messages: RoomMessage[];
+    code: string;
+    codeVersion: number;
+    latestAnalysis?: any;
+  }) => {
     setActiveRoom(joinData.room);
     setCurrentMember(joinData.member);
     setRoomMembers(joinData.members);
@@ -658,6 +734,11 @@ export default function App() {
     setCode(joinData.code);
     setLanguage(joinData.room.language);
     setMode(joinData.room.mode as LearningMode);
+
+    localStorage.setItem('codepilot_active_room_id', joinData.room.id);
+    localStorage.setItem('codepilot_user_name', joinData.member.userName);
+    localStorage.setItem('codepilot_client_id', joinData.member.clientId);
+    clientIdRef.current = joinData.member.clientId;
 
     if (joinData.latestAnalysis) {
       setAnalysis(joinData.latestAnalysis.analysis);
@@ -673,13 +754,34 @@ export default function App() {
     setRoomNotification(`🚪 Joined room ${joinData.room.name}`);
   };
 
+  const handleRespondJoinRequest = async (requestId: string, approved: boolean) => {
+    try {
+      await realtimeService.respondJoinRequest(requestId, approved);
+      setPendingJoinRequests((prev) => prev.filter((r) => r.requestId !== requestId));
+      if (approved) {
+        setRoomNotification('✅ Collaborator join request accepted.');
+      } else {
+        setRoomNotification('❌ Collaborator join request rejected.');
+      }
+      setTimeout(() => setRoomNotification(null), 3000);
+    } catch (err) {
+      console.error('Failed to respond to join request:', err);
+    }
+  };
+
   const handleLeaveRoom = () => {
-    realtimeService.leaveRoom();
+    localStorage.removeItem('codepilot_active_room_id');
+    if (activeRoom && currentMember) {
+      realtimeService.leaveRoom(activeRoom.id, currentMember.clientId, currentMember.userName);
+    } else {
+      realtimeService.leaveRoom();
+    }
     setActiveRoom(null);
     setCurrentMember(null);
     setRoomMembers([]);
     setRoomMessages([]);
     setPeerCursors([]);
+    setPendingJoinRequests([]);
     setIsDrawerOpen(false);
     setRoomNotification('Left room. You are now in Solo Studio mode.');
     setTimeout(() => setRoomNotification(null), 3000);
@@ -1150,10 +1252,65 @@ export default function App() {
         isOpen={isRoomModalOpen}
         onClose={() => setIsRoomModalOpen(false)}
         onCreateRoom={handleCreateRoom}
-        onJoinRoom={handleJoinRoom}
-        currentLanguage={language}
-        currentMode={mode}
+        onJoinApproved={handleJoinApproved}
       />
+
+      {/* ─── Host Security Approval Prompt for Incoming Join Requests ─── */}
+      {pendingJoinRequests.length > 0 && activeRoom && currentMember?.role === 'host' && (
+        <aside aria-label="Incoming Join Requests" className="fixed top-14 right-6 z-50 w-88 max-w-[calc(100vw-2rem)] animate-bounce-subtle">
+          <div className="bg-[#0b101c]/95 border-2 border-cyan-500/80 rounded-2xl p-4 shadow-2xl shadow-cyan-950/80 backdrop-blur-xl flex flex-col gap-3">
+            <div className="flex items-center justify-between pb-2 border-b border-gray-800">
+              <div className="flex items-center gap-2">
+                <span className="w-2.5 h-2.5 rounded-full bg-cyan-400 animate-ping" />
+                <span className="text-xs font-bold text-white tracking-wide flex items-center gap-1.5">
+                  🛡️ Security: Join Request
+                </span>
+              </div>
+              <span className="text-[10px] px-2 py-0.5 rounded-full bg-cyan-950 text-cyan-300 font-mono font-bold border border-cyan-800/60">
+                {pendingJoinRequests.length} Pending
+              </span>
+            </div>
+
+            <div className="flex flex-col gap-2.5 max-h-60 overflow-y-auto">
+              {pendingJoinRequests.map((req) => (
+                <div
+                  key={req.requestId}
+                  className="p-3 rounded-xl bg-gray-900/90 border border-gray-800 flex flex-col gap-2.5"
+                >
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2.5">
+                      <div className="w-8 h-8 rounded-lg bg-gradient-to-tr from-cyan-600 to-blue-600 flex items-center justify-center text-xs font-bold text-white shadow">
+                        {req.userName.charAt(0).toUpperCase()}
+                      </div>
+                      <div>
+                        <div className="text-xs font-bold text-white">{req.userName}</div>
+                        <div className="text-[10px] text-gray-400">requested to join room</div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2 pt-1">
+                    <button
+                      onClick={() => handleRespondJoinRequest(req.requestId, false)}
+                      className="py-1.5 px-3 rounded-lg bg-rose-950/70 hover:bg-rose-900/90 border border-rose-800/70 text-rose-300 hover:text-white text-xs font-semibold transition-all cursor-pointer flex items-center justify-center gap-1.5"
+                    >
+                      <span>✕</span>
+                      <span>Reject</span>
+                    </button>
+                    <button
+                      onClick={() => handleRespondJoinRequest(req.requestId, true)}
+                      className="py-1.5 px-3 rounded-lg bg-gradient-to-r from-emerald-500 to-cyan-500 hover:from-emerald-400 hover:to-cyan-400 text-white text-xs font-bold transition-all shadow-md shadow-emerald-950/50 cursor-pointer flex items-center justify-center gap-1.5"
+                    >
+                      <span>✓</span>
+                      <span>Accept</span>
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </aside>
+      )}
 
       {/* ─── Active Collaborators & Room Chat Drawer ─── */}
       {activeRoom && (
@@ -1167,6 +1324,8 @@ export default function App() {
           messages={roomMessages}
           isConnected={isConnected}
           isAiThinking={isAiThinking}
+          pendingRequests={pendingJoinRequests}
+          onRespondJoinRequest={handleRespondJoinRequest}
           onSendMessage={(content, askPilot) => {
             realtimeService.sendChatMessage(activeRoom.id, content, askPilot);
           }}
