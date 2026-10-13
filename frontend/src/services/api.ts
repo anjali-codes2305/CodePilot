@@ -5,7 +5,7 @@
 
 import type { AnalyzeRequest, AnalyzeResponse, ChatRequest, ChatResponse } from '../types';
 
-const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:3001';
+const API_BASE = import.meta.env.VITE_API_URL || 'https://codepilot-owya.onrender.com';
 
 async function handleResponse<T>(res: Response): Promise<T> {
   let data: any;

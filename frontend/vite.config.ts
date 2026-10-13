@@ -12,8 +12,9 @@ export default defineConfig({
     // Proxy API requests to backend in development
     proxy: {
       '/api': {
-        target: 'http://localhost:3001',
+        target: 'https://codepilot-owya.onrender.com',
         changeOrigin: true,
+        secure: false,
       }
     }
   }
